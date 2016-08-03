@@ -1,0 +1,166 @@
+#!/bin/bash
+
+FW_DIST_IP=10.6.96.65
+FW_DIST_USER=tempuser
+FW_DIST_PASSWD=tempuser
+GETREV=/c4shares/auto/devutils/bin/getrevs
+MAIL_FILE=/c4_working/locallabstatus.txt
+SWARM_FILE=/var/tmp/locallab_swarm_file.txt
+#TO="China.COE.EMSD.Platform.Scrum.Bringup@emc.com"
+SENDER="bolt.liu@emc.com"
+TO="rui.chang@emc.com,leon.li@emc.com,bolt.liu@emc.com,colin.cai@emc.com,tim.jiang@emc.com,andy.y.liu@emc.com,yinlong.lu@emc.com,eric.x.wang@emc.com,olivia.chen@emc.com,jack.bian@emc.com,alvin.zhang@emc.com,mingchao.lu@emc.com,yechen.huang@emc.com,eric.yao@emc.com,zhenhua.dong@emc.com,doris.qiao@emc.com,guifeng.tang@emc.com"
+#TO="bolt.liu@emc.com"
+
+#ulog $$ $0 $@ > /dev/null 2>&1 &
+export PATH=$PATH:/c4shares/auto/devutils/bin
+
+function report_sp_power_status()
+{
+    local BMCIP=$1
+    ipmitool -I lanplus -H $BMCIP -U admin -P Password1 chassis power status | grep on > /dev/null
+    if [ $? -ne 0 ]; then
+        echo "SP with BMC IP $BMCIP is powered off or BMC couldn't be connected" >> $MAIL_FILE
+        return 1
+    fi
+
+    return 0
+}
+
+function report_sp_mode()
+{
+    local SP=$1
+    mode=`ssh root@$SP get_boot_mode`
+    if [ ! -n "$mode" ]; then
+        echo "couldn't connect to $SP" >> $MAIL_FILE
+        return 1
+    fi
+
+    if [ "$mode" != "Normal Mode" ]; then
+        echo "$SP is not in Normal Mode, mode: $mode" >> $MAIL_FILE
+        return 1
+    fi
+
+    system_complete=`ssh root@$SP system-state.sh list |grep ^system_complete`
+
+    if [ "$system_complete" != "system_complete" ]; then
+        echo "$SP is not fully up." >> $MAIL_FILE
+        return 1
+    fi
+	
+    return 0
+}
+
+function report_getrevs()
+{
+    local IPA=$1
+    scp -o ConnectTimeout=8 $GETREV root@$IPA:/var/tmp > /dev/null
+    ssh -o ConnectTimeout=8 root@$IPA 'cd /var/tmp; bash getrevs' > /c4_working/getrevs.log
+
+    cat /c4_working/getrevs.log | grep -e ERROR -e WARN > /dev/null
+    if [ $? -eq 0 ]; then
+        #echo "SP $IPA getrevs info:" >> $MAIL_FILE
+        echo "SP with IP $IPA has getrevs problem" >> $MAIL_FILE
+        cat /c4_working/getrevs.log | grep -e ERROR -e WARN >> $MAIL_FILE
+        return 1
+    fi
+    return 0
+}
+
+
+function report_sel_log()
+{
+    local BMCIP=$1
+    ipmitool -I lanplus -H $BMCIP -U admin -P Password1 sel list | grep -i -e error -e fail -e fault -e unexpect -e fatal -e invalid -e ierr -e warn > /c4_working/sel.log
+    if [ $? -eq 0 ]; then
+        echo "SP with BMC IP $BMCIP has SEL LOG problem" >> $MAIL_FILE
+        cat /c4_working/sel.log >> $MAIL_FILE
+        return 1
+    fi
+
+    return 0
+}
+
+
+check_status_for_sp()
+{
+    local BMCIP=$1
+    local SPIP=$2
+    local warning=0
+
+    report_sp_power_status $BMCSPA || return 1
+    report_sel_log $BMCSPA || warning=1
+    report_sp_mode $SPIP || warning=1
+    report_getrevs $SPIP || warning=1
+
+    return $warning
+}
+
+function check_status_for_array()
+{
+    local ARRAY=$1
+    local warning=0
+
+    SPA=`swarm $ARRAY 2>&1 |grep 'Lab IP SPA' | cut -d: -f2 | awk '{print $1}'`
+    SPB=`swarm $ARRAY 2>&1 |grep 'Lab IP SPB' | cut -d: -f2 | awk '{print $1}'`
+    BMCSPA=`swarm $ARRAY 2>&1 |grep 'BMC IP SPA' | cut -d: -f2 | awk '{print $1}'`
+    BMCSPB=`swarm $ARRAY 2>&1 |grep 'BMC IP SPB' | cut -d: -f3 | awk '{print $1}'`
+
+    echo "------------------------------status of ARRAY $ARRAY------------------------------" >> $MAIL_FILE
+
+    echo "checking status of SPA($SPA)... " >> $MAIL_FILE
+    check_status_for_sp $BMCSPA $SPA || warning=1
+    echo "" >> $MAIL_FILE
+
+    echo "checking status of SPB($SPB)... " >> $MAIL_FILE
+    check_status_for_sp $BMCSPB $SPB || warning=1
+    echo "" >> $MAIL_FILE
+
+    if [ $warning -eq 1 ]; then
+        echo "ARRAY $ARRAY might have issue, please check the info above." >> $MAIL_FILE
+    else
+        echo "ARRAY $ARRAY is in a good shape." >> $MAIL_FILE
+    fi
+    echo "" >> $MAIL_FILE
+}
+
+function scan_system()
+{
+    local ARRAY=$1
+    check_status_for_array $ARRAY
+}
+
+function scan_all_systems()
+{
+    local_arraies=(OB-S2004 OB-S2005 OB-S2006 OB-S2007 OB-S2008 OB-S2009 OB-S2010 OB-S2011 OB-S2012 OB-S2013 OB-S2014)
+    #local_arraies=(OB-S2004 OB-S2005 OB-S2009)
+
+    for i in ${local_arraies[*]}; do
+        scan_system $i       
+    done
+
+}
+
+echo "Hi ALL," > $MAIL_FILE
+echo "" >> $MAIL_FILE
+echo "here's the status in local lab." >> $MAIL_FILE
+echo "it will check the following items:" >> $MAIL_FILE
+echo "* the power status of SPs" >> $MAIL_FILE
+echo "* the SEL log of SPs" >> $MAIL_FILE
+echo "* the Normal mode or service mode of SPs" >> $MAIL_FILE
+echo "* the getrevs status of SPs" >> $MAIL_FILE
+echo "please note only warnings or errors will be reported for SPs" >> $MAIL_FILE
+echo "" >> $MAIL_FILE
+
+scan_all_systems
+
+echo "" >> $MAIL_FILE
+echo "please note: this mail will be automatically sent at 9:30AM everyday, let me know if you don't want to receive the mail." >> $MAIL_FILE
+echo "" >> $MAIL_FILE
+
+echo "Best Regards," >> $MAIL_FILE
+echo "Bolt Liu" >> $MAIL_FILE
+echo "USD Platform, China COE" >> $MAIL_FILE
+
+sudo mail -s "LOCAL ARRAY STATUS REPORT!" -r $SENDER $TO < $MAIL_FILE
+
+#rm -f $MAIL_FILE
